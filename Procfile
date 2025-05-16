@@ -1,0 +1,1 @@
+web: python MP DISTRICT WASTE MAP DASHBOARD.py
