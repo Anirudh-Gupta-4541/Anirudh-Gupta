@@ -1,15 +1,25 @@
 import pandas as pd
-import plotly.graph_objects as go
+import json
 import plotly.express as px
-import dash
-from dash import dcc, html
-from dash.dependencies import Input, Output
+import plotly.graph_objects as go
+from dash import Dash, html, dcc, Input, Output
 
-# Load data
-file_path = "District data.xlsx"
-df = pd.read_excel(file_path, sheet_name="Dist Wise Pivot  (2)", header=2)
+# === Load GeoJSON ===
+try:
+    with open("MP Districts Website Map final.geojson", "r", encoding="utf-8") as f:
+        geojson_data = json.load(f)
+except Exception as e:
+    raise FileNotFoundError(f"Error loading GeoJSON file: {e}")
 
-# Clean column names
+districts_geo = geojson_data
+district_names = [f["properties"]["Dist_Name"] for f in geojson_data["features"]]
+
+# === Load Excel Data ===
+try:
+    df = pd.read_excel("District data.xlsx", sheet_name="Dist Wise Pivot  (2)", header=2)
+except Exception as e:
+    raise FileNotFoundError(f"Error loading Excel file: {e}")
+
 df.columns = [str(col).strip() for col in df.columns]
 df = df.rename(columns={df.columns[0]: "District"})
 df = df[df["District"].notna() & df["District"].str.strip().ne("")]
@@ -17,183 +27,177 @@ df = df[df["District"].notna() & df["District"].str.strip().ne("")]
 def safe(val):
     return float(val) if pd.notna(val) else 0.0
 
-# Initialize Dash app
-app = dash.Dash(__name__)
+# === Helper for empty figures ===
+def empty_figure(title):
+    fig = go.Figure()
+    fig.update_layout(
+        title={"text": title, "x": 0.5, "font": {"size": 20, "color": "white", "family": "Arial"}},
+        plot_bgcolor="#1e1e1e", paper_bgcolor="#1e1e1e", font_color="white",
+        xaxis={"visible": False}, yaxis={"visible": False},
+        margin={"r":0, "t":40, "l":0, "b":0}
+    )
+    return fig
+
+# === Create Dash App ===
+app = Dash(__name__)
 app.title = "MP Waste Dashboard"
 
-# Layout
+# Create choropleth map with color by waste generated
+map_fig = px.choropleth_map(
+    df,
+    geojson=districts_geo,
+    locations="District",
+    featureidkey="properties.Dist_Name",
+    color="Sum of SW_Generation (TPD)",  # Color by waste generated
+    color_continuous_scale="bluered",
+    map_style="carto-positron",
+    range_color = (0, 1500),
+    center={"lat": 24, "lon": 78.5},
+    zoom=6,
+    opacity=0.7
+)
+map_fig.update_traces(
+    marker_line_width=1,
+    marker_line_color="black",
+    hovertemplate="%{location}<br>Waste Generated: %{z:.2f} TPD<extra></extra>"
+)
+map_fig.update_layout(
+    margin={"r":0, "t":0, "l":0, "b":0},
+    clickmode="event+select",
+    dragmode=False,
+    uirevision=True,
+    coloraxis_colorbar=dict(title="Waste Generated (TPD)"),
+    paper_bgcolor="#ffffff",
+)
+
 app.layout = html.Div([
-    html.H1("Madhya Pradesh District-wise Waste Management Dashboard",
-            style={"textAlign": "center", "color": "white"}),
+    html.H2("Madhya Pradesh District Waste Dashboard", style={"textAlign": "center", "color": "white", "fontSize": "28px", "fontWeight": "bold"}),
+    html.Div([
+        dcc.Graph(
+            id="district-map",
+            figure=map_fig,
+            config={"scrollZoom": False, "displayModeBar": False},
+            style={"height": "700px", "width": "100%"}
+        )
+    ], style={"overflow": "hidden", "marginTop": "40px"}),
 
-    dcc.Dropdown(
-        id="district-dropdown",
-        options=[{"label": dist, "value": dist} for dist in df["District"].unique()],
-        value=df["District"].iloc[0],
-        placeholder="Select a District",
-        style={"color": "black"}
-    ),
-
-    html.Div(id="kpi-cards", style={
-        "display": "flex",
-        "justifyContent": "space-around",
-        "margin": "20px 0"
-    }),
-
+    html.Div(id="kpi-cards", style={"display": "flex", "justifyContent": "space-around", "margin": "20px 0", "flexWrap": "wrap"}),
     dcc.Graph(id="population-forecast"),
-    html.Div(id="waste-bar-comparison", style={"display": "flex", "justifyContent": "space-between"}),
-    html.Div(id="pie-comparison", style={"display": "flex", "justifyContent": "space-between"})
-
+    html.Div(id="current-bar-pie", style={"display": "flex", "justifyContent": "space-between", "flexWrap": "wrap"}),
+    html.Div([dcc.Graph(id="waste-comp-pie")])
 ], style={"backgroundColor": "#1e1e1e", "padding": "20px", "fontFamily": "Arial"})
-
 
 @app.callback(
     [Output("kpi-cards", "children"),
      Output("population-forecast", "figure"),
-     Output("waste-bar-comparison", "children"),
-     Output("pie-comparison", "children")],
-    [Input("district-dropdown", "value")]
+     Output("current-bar-pie", "children"),
+     Output("waste-comp-pie", "figure")],
+    Input("district-map", "clickData")
 )
-def update_dashboard(selected_district):
-    try:
-        row = df[df["District"] == selected_district].iloc[0]
+def update_dashboard(clickData):
+    if not clickData or "points" not in clickData:
+        return [html.Div("Click a district on the map", style={"color": "white", "flex": "1", "textAlign": "center"})], \
+               empty_figure("Population Forecast"), [], empty_figure("Waste Composition")
 
-        # KPI Cards
-        census_pop = safe(row["Sum of Census 2011 Population"])
-        sw_gen = safe(row["Sum of SW_Generation (TPD)"])
-        sw_proc = safe(row["Sum of SW_Processed_ (TPD)"])
-        sw_gap = safe(row["Sum of SW Collection Gap (in TPD)"])
+    district_name = clickData["points"][0]["location"]
+    match_row = df[df["District"].str.lower().str.strip() == district_name.lower().strip()]
 
-        processed_percent = (sw_proc / sw_gen * 100) if sw_gen > 0 else 0
+    if match_row.empty:
+        return [html.Div("No data for selected district", style={"color": "white", "flex": "1", "textAlign": "center"})], \
+               empty_figure("Population Forecast"), [], empty_figure("Waste Composition")
 
-        kpis = [
-            f"{int(census_pop):,}",
-            f"{sw_gen:.2f} TPD",
-            f"{processed_percent:.1f}%",
-            f"{sw_gap:.2f} TPD"
-        ]
-        titles = ["Census 2011 Pop", "SW Generated", "% Waste Processed", "Gap in Collection"]
+    row = match_row.iloc[0]
 
-        cards = [html.Div([
-            html.H4(title),
-            html.P(value)
-        ], style={
-            "padding": "10px",
-            "border": "1px solid #444",
-            "borderRadius": "10px",
-            "width": "18%",
-            "backgroundColor": "#2c2c2c",
-            "color": "white",
-            "textAlign": "center"
-        }) for title, value in zip(titles, kpis)]
+    census_pop = safe(row.get("Sum of Census 2011 Population", 0))
+    sw_gen = safe(row.get("Sum of SW_Generation (TPD)", 0))
+    sw_proc = safe(row.get("Sum of SW_Processed_ (TPD)", 0))
+    sw_gap = safe(row.get("Sum of SW Collection Gap (in TPD)", 0))
+    processed_percent = (sw_proc / sw_gen * 100) if sw_gen > 0 else 0
+    sewage_gen = safe(row.get("Sum of Sewage Generation (in MLD)", 0))
+    growth_rate = safe(row.get("Average of Decadal Grouth Rate in % (During 2001-2011)"))
 
-        # Population Forecast
-        trend_fig = go.Figure()
-        trend_fig.add_trace(go.Scatter(
-            x=["2011", "2025", "2030"],
-            y=[safe(row['Sum of Census 2011 Population']),
-               safe(row['Sum of Projected Population by 2025']),
-               safe(row['Sum of Projected Population by 2030'])],
-            mode='lines+markers',
-            name="Population",
-            line=dict(color="blue", width=3),
-            marker=dict(color="red", size=10)
-        ))
-        trend_fig.update_layout(
-            title="Population Forecast",
-            yaxis_title="Population",
-            plot_bgcolor="#1e1e1e",
-            paper_bgcolor="#1e1e1e",
-            font_color="white",
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor="#333", nticks=8)  # 🔧 more ticks
-        )
+    kpis = [
+        ("Census 2011 Pop", f"{int(census_pop):,}"),
+        ("SW Generated", f"{sw_gen:.2f} TPD"),
+        ("% Waste Processed", f"{processed_percent:.1f}%"),
+        ("Sewage Gen (MLD)", f"{sewage_gen:.2f}"),
+        ("Decadal Growth Rate", f"{growth_rate*100:.2f}%")
+    ]
+    cards = [html.Div([html.H4(title), html.P(value)], style={
+        "padding": "10px", "border": "1px solid #444", "borderRadius": "10px",
+        "flex": "1 1 18%", "backgroundColor": "#2c2c2c", "color": "white", "textAlign": "center", "margin": "0 5px"
+    }) for title, value in kpis]
 
-        # Extract values for bar comparison
-        curr_gen = safe(row["Sum of SW_Generation (TPD)"])
-        curr_proc = safe(row["Sum of SW_Processed_ (TPD)"])
-        curr_gap = safe(row["Sum of SW Collection Gap (in TPD)"])
+    pop_forecast = go.Figure()
+    pop_forecast.add_trace(go.Scatter(
+        x=["2011", "2025", "2030"],
+        y=[
+            round(census_pop, 3),
+            round(safe(row.get("Sum of Projected Population by 2025", 0)), 2),
+            round(safe(row.get("Sum of Projected Population by 2030", 0)), 2)
+        ],
+        mode='lines+markers',
+        line=dict(color="red", width=3),
+        marker=dict(color="blue", size=15)
+    ))
+    pop_forecast.update_layout(
+        title={"text": "Population Forecast", "x": 0.5, "font": {"size": 30, "color": "white", "family": "Arial"}},
+        yaxis_title="Population",
+        xaxis=dict(showgrid=False),  # Hides vertical gridlines
+        plot_bgcolor="#1e1e1e",
+        paper_bgcolor="#1e1e1e",
+        font_color="white"
+    )
 
-        fut_gen = safe(row["Sum of SW_Generation (TPD)-2030"])
-        fut_proc = safe(row["Sum of SW_Processed_ (TPD)-2030"])
-        fut_gap = safe(row["Sum of SW Collection Gap (in TPD)-2030"])
+    bar_fig = go.Figure()
+    bar_fig.add_trace(go.Bar(name=f"Generated: {sw_gen:.2f} TPD", x=["Generated"], y=[round(sw_gen, 2)], marker_color="blue"))
+    bar_fig.add_trace(go.Bar(name=f"Processed: {sw_proc:.2f} TPD", x=["Processed"], y=[round(sw_proc, 2)], marker_color="green"))
+    bar_fig.add_trace(go.Bar(name=f"Gap: {sw_gap:.2f} TPD", x=["Gap"], y=[round(sw_gap, 2)], marker_color='red'))
+    bar_fig.update_layout(title={"text": "Current Waste Metrics (TPD)", "x": 0.5, "font": {"size": 20, "color": "white", "family": "Arial"}},
+                          barmode='group',
+                          plot_bgcolor="#1e1e1e", paper_bgcolor="#1e1e1e", font_color="white",
+                          margin={"r":0, "t":40, "l":0, "b":0})
 
-        y_max = max(curr_gen, curr_proc, curr_gap, fut_gen, fut_proc, fut_gap) * 1.1
+    # Pie Chart Patch for >100% Processed
+    proc_pie = min(sw_proc, sw_gen)
+    gap_pie = max(0, sw_gen - proc_pie)
+    proc_label = "Processed (100%)" if sw_proc > sw_gen else "Processed"
 
-        # Current Waste Bar Chart
-        current_fig = go.Figure()
-        current_fig.add_trace(go.Bar(name="Generated", x=["Current"], y=[curr_gen], marker_color="blue"))
-        current_fig.add_trace(go.Bar(name="Processed", x=["Current"], y=[curr_proc], marker_color="green"))
-        current_fig.add_trace(go.Bar(name="Gap", x=["Current"], y=[curr_gap], marker_color="red"))
-        current_fig.update_layout(title="Current Waste Metrics (TPD)",
-                                  barmode='group',
-                                  yaxis=dict(range=[0, y_max]),
-                                  plot_bgcolor="#1e1e1e",
-                                  paper_bgcolor="#1e1e1e",
-                                  font_color="white")
+    pie_fig = px.pie(
+        names=[proc_label, "Gap"],
+        values=[proc_pie, gap_pie],
+        hole=0.3,
+        color_discrete_map={proc_label: "green", "Gap": "red"}
+    )
+    pie_fig.update_layout(title={"text": "Processed vs Gap (TPD)", "x": 0.5, "font": {"size": 20, "color": "white", "family": "Arial"}},
+                          plot_bgcolor="#1e1e1e", paper_bgcolor="#1e1e1e", font_color="white",
+                          margin={"r":0, "t":40, "l":0, "b":0})
 
-        # Future Waste Bar Chart
-        future_fig = go.Figure()
-        future_fig.add_trace(go.Bar(name="Generated", x=["2030"], y=[fut_gen], marker_color="blue"))
-        future_fig.add_trace(go.Bar(name="Processed", x=["2030"], y=[fut_proc], marker_color="green"))
-        future_fig.add_trace(go.Bar(name="Gap", x=["2030"], y=[fut_gap], marker_color="red"))
-        future_fig.update_layout(title="2030 Waste Metrics (TPD)",
-                                 barmode='group',
-                                 yaxis=dict(range=[0, y_max]),
-                                 plot_bgcolor="#1e1e1e",
-                                 paper_bgcolor="#1e1e1e",
-                                 font_color="white")
+    pw = safe(row.get("Sum of Estimated PW Generation in TPD", 0))
+    cd = safe(row.get("Sum of C&D Waste Generation in TPD - 2025", 0))
+    ew = safe(row.get("Sum of e-waste Generation (TPA)", 0)) / 365
+    other = max(0, sw_gen - (pw + cd + ew))
+    comp_labels = [f"Plastic Waste: {pw:.2f} TPD", f"C&D: {cd:.2f} TPD", f"E-waste: {ew:.2f} TPD", f"Other: {other:.2f} TPD"]
+    comp_pie = px.pie(names=comp_labels, values=[pw, cd, ew, other], hole=0.3,
+                      color_discrete_sequence=["#2ca02c", "#c7c7c7", "#ff7f0e", "#1f77b4"])
+    comp_pie.update_layout(title={"text": "Waste Composition (TPD)", "x": 0.5, "font": {"size": 20, "color": "white", "family": "Arial"}},
+                           plot_bgcolor="#1e1e1e", paper_bgcolor="#1e1e1e", font_color="white",
+                           margin={"r":0, "t":40, "l":0, "b":0})
 
-        bar_row = [
-            dcc.Graph(figure=current_fig, style={"width": "48%"}),
-            dcc.Graph(figure=future_fig, style={"width": "48%"})
-        ]
+    # District Name Card
+    district_card = html.Div([
+        html.H4("District"),
+        html.P(district_name)
+    ], style={
+        "padding": "10px", "border": "1px solid #444", "borderRadius": "10px",
+        "flex": "1 1 18%", "backgroundColor": "#2c2c2c", "color": "white",
+        "textAlign": "center", "margin": "0 5px"
+    })
 
-        # Pie charts with consistent colors
-        current_pie = px.pie(
-            names=["Processed", "Gap"],
-            values=[curr_proc, curr_gap],
-            hole=0.3,
-            color_discrete_map={"Processed": "green", "Gap": "red"}
-        )
-        current_pie.update_traces(textinfo='percent+label',
-                                  hovertemplate='%{label}: %{value:.2f} TPD')
-        current_pie.update_layout(title="Current Waste Processed vs Gap",
-                                  plot_bgcolor="#1e1e1e",
-                                  paper_bgcolor="#1e1e1e",
-                                  font_color="white")
+    cards.insert(5, district_card)
 
-        future_pie = px.pie(
-            names=["Processed", "Gap"],
-            values=[fut_proc, fut_gap],
-            hole=0.3,
-            color_discrete_map={"Processed": "green", "Gap": "red"}
-        )
-        future_pie.update_traces(textinfo='percent+label',
-                                 hovertemplate='%{label}: %{value:.2f} TPD')
-        future_pie.update_layout(title="2030 Waste Processed vs Gap",
-                                 plot_bgcolor="#1e1e1e",
-                                 paper_bgcolor="#1e1e1e",
-                                 font_color="white")
+    return cards, pop_forecast, [dcc.Graph(figure=bar_fig, style={"width": "48%", "marginBottom": "20px"}),
+                                 dcc.Graph(figure=pie_fig, style={"width": "48%", "marginBottom": "20px"})], comp_pie
 
-        pie_row = [
-            dcc.Graph(figure=current_pie, style={"width": "48%"}),
-            dcc.Graph(figure=future_pie, style={"width": "48%"})
-        ]
-
-        return cards, trend_fig, bar_row, pie_row
-
-    except Exception as e:
-        print("⚠️ Callback error:", e)
-        return [html.Div("Error loading data")], go.Figure(), [], []
-
-
-# Run server
 if __name__ == "__main__":
-    app.run(debug=True)
-
-import os
-
-port = int(os.environ.get("PORT", 5000))
-app.run(host="0.0.0.0", port=port)
-
+    app.run(debug=False, use_reloader=False)
