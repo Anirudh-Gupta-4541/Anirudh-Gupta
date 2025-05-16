@@ -1,1 +1,0 @@
-This contains files for a dashboard, which will give information of waste generation, processing and gap in waste management, in the districts of Madhya Pradesh. It contains the python file, excel file and the libraries needed
